@@ -32,17 +32,20 @@ def env_required(name: str) -> str:
 
 def normalize_channel(value: str) -> str:
     v = value.strip()
-    if v.startswith("@"):
+    if not v:
         return v
     # allow numeric chat_id
     if v.lstrip("-").isdigit():
         return v
-    return "@" + v
+    # public username
+    if not v.startswith("@"):
+        v = "@" + v
+    return v
 
 
 def get_target_date_utc() -> datetime:
     """
-    По умолчанию берём ВЧЕРА в UTC (так как Cron на Railway показывает UTC).
+    Берём ВЧЕРА в UTC (Railway cron показывает UTC).
     Для теста можно задать TARGET_DATE=YYYY-MM-DD
     """
     override = os.getenv("TARGET_DATE", "").strip()
@@ -58,7 +61,6 @@ def http_get(session: requests.Session, url: str, timeout_s: int = 30) -> reques
     for attempt in range(1, 4):
         try:
             r = session.get(url, headers=DEFAULT_HEADERS, timeout=timeout_s, allow_redirects=True)
-            # мягкие ретраи для временных проблем
             if r.status_code in (429, 500, 502, 503, 504):
                 time.sleep(2 * attempt)
                 continue
@@ -93,9 +95,9 @@ def mark_posted(conn: sqlite3.Connection, url: str) -> None:
 
 def extract_blog_base_urls(session: requests.Session) -> list[str]:
     """
-    Забираем список блогов со страницы Meet All Bloggers:
+    Список блогов со страницы:
     https://blogs.mathworks.com/blogger/
-    Берём только ссылки вида https://blogs.mathworks.com/<slug>/
+    Берём ссылки вида https://blogs.mathworks.com/<slug>/
     """
     r = http_get(session, BLOGGER_LIST_URL)
     if r.status_code != 200:
@@ -108,8 +110,6 @@ def extract_blog_base_urls(session: requests.Session) -> list[str]:
         href = a["href"].strip()
         if not href:
             continue
-
-        # относительные ссылки делаем абсолютными
         if href.startswith("/"):
             href = urljoin(BASE, href)
 
@@ -121,7 +121,6 @@ def extract_blog_base_urls(session: requests.Session) -> list[str]:
         if not path:
             continue
 
-        # хотим ровно 1 сегмент: /matlab/ /simulink/ /cleve/ ...
         segs = path.split("/")
         if len(segs) != 1:
             continue
@@ -130,7 +129,6 @@ def extract_blog_base_urls(session: requests.Session) -> list[str]:
         if not slug:
             continue
 
-        # отсекаем не-блоги
         if slug in {"blogger", "blogs", "search"}:
             continue
         if slug.isdigit():
@@ -143,8 +141,8 @@ def extract_blog_base_urls(session: requests.Session) -> list[str]:
 
 def extract_posts_from_daily_page(html_text: str) -> list[dict]:
     """
-    На дневной странице /YYYY/MM/DD/ вытаскиваем заголовок и ссылку поста.
-    Обычно это .entry-title a
+    На дневной странице /YYYY/MM/DD/ вытаскиваем заголовок и ссылку.
+    Обычно селектор: .entry-title a
     """
     soup = BeautifulSoup(html_text, "html.parser")
     posts = []
@@ -156,7 +154,6 @@ def extract_posts_from_daily_page(html_text: str) -> list[dict]:
             continue
         posts.append({"title": title, "url": href})
 
-    # дедуп по url
     uniq = {}
     for p in posts:
         uniq[p["url"]] = p
@@ -165,16 +162,13 @@ def extract_posts_from_daily_page(html_text: str) -> list[dict]:
 
 def telegram_send_message(session: requests.Session, bot_token: str, chat_id: str, title: str, url: str) -> None:
     api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-
     text = f"<b>{html.escape(title)}</b>\n{html.escape(url)}"
     payload = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
-        # предпросмотр ссылок можно оставить (не отключаем)
-        # "disable_web_page_preview": False,
+        "disable_web_page_preview": False,
     }
-
     r = session.post(api_url, data=payload, timeout=30)
     if r.status_code != 200:
         raise RuntimeError(f"Telegram sendMessage failed: status={r.status_code} body={r.text}")
@@ -182,7 +176,7 @@ def telegram_send_message(session: requests.Session, bot_token: str, chat_id: st
 
 def main() -> None:
     bot_token = env_required("BOT_TOKEN")
-    channel = normalize_channel(env_required("CHANNEL_USERNAME"))
+    channel = normalize_channel(env_required("CHANNEL_CHAT_ID"))
 
     target_date = get_target_date_utc()
     yyyy = target_date.strftime("%Y")
@@ -194,13 +188,11 @@ def main() -> None:
     conn = init_db()
 
     with requests.Session() as session:
-        # 1) список блогов
         blog_bases = extract_blog_base_urls(session)
         print(f"[INFO] Found blog bases: {len(blog_bases)}")
 
         all_posts = []
 
-        # 2) обходим дневные страницы
         for base_url in blog_bases:
             daily_url = urljoin(base_url, f"{yyyy}/{mm}/{dd}/")
             try:
@@ -220,18 +212,14 @@ def main() -> None:
                 print(f"[INFO] {daily_url} -> {len(posts)} post(s)")
                 all_posts.extend(posts)
 
-        # 3) дедуп по url
         uniq = {}
         for p in all_posts:
             uniq[p["url"]] = p
         posts_to_send = list(uniq.values())
-
-        # сортировка для стабильного порядка (по url)
         posts_to_send.sort(key=lambda x: x["url"])
 
         print(f"[INFO] Total unique posts for {target_date.date()}: {len(posts_to_send)}")
 
-        # 4) отправка в Telegram
         sent = 0
         skipped = 0
         for p in posts_to_send:
@@ -242,7 +230,7 @@ def main() -> None:
             telegram_send_message(session, bot_token, channel, p["title"], p["url"])
             mark_posted(conn, p["url"])
             sent += 1
-            time.sleep(1.0)  # чтобы не упереться в лимиты
+            time.sleep(1.0)
 
         print(f"[DONE] sent={sent} skipped_already_posted={skipped}")
 
