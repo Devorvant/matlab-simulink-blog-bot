@@ -9,7 +9,6 @@ import requests
 from dateutil import parser as dtparser
 
 RSS_URL = os.getenv("RSS_URL", "https://blogs.mathworks.com/feedmlc")
-
 TZ = os.getenv("TZ", "Europe/Rome")
 TIMEZONE = ZoneInfo(TZ)
 
@@ -63,6 +62,19 @@ def parse_entry_datetime(entry) -> datetime | None:
         return None
 
 
+def fetch_feed(url: str):
+    # Иногда без User-Agent/Accept сервер может вернуть HTML/ошибку вместо RSS
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; railway-bot/1.0)",
+        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+    }
+    r = requests.get(url, headers=headers, timeout=30)
+    if r.status_code != 200:
+        print(f"Feed HTTP {r.status_code}: {r.text[:200]}")
+        return None
+    return feedparser.parse(r.content)
+
+
 def send_to_telegram(text: str):
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set")
@@ -91,14 +103,24 @@ def main():
     now = datetime.now(tz=TIMEZONE)
     target_date = (now - timedelta(days=1)).date()
 
-    feed = feedparser.parse(RSS_URL)
+    feed = fetch_feed(RSS_URL)
+    if feed is None:
+        # Не падаем, чтобы Railway не делал ретраи
+        return
 
-    if getattr(feed, "bozo", False) and not getattr(feed, "entries", None):
-        print(f"Failed to parse feed: {getattr(feed, 'bozo_exception', None)}", file=sys.stderr)
-        sys.exit(1)
+    if getattr(feed, "bozo", False):
+        # bozo = была ошибка парсинга (например, "mismatched tag")
+        # Но иногда entries всё равно есть — тогда продолжаем.
+        print(f"Feed parse warning: {getattr(feed, 'bozo_exception', None)}")
+
+    entries = getattr(feed, "entries", None) or []
+    if not entries:
+        # Не считаем это фатальной ошибкой
+        print("Feed has no entries (or could not be parsed into entries).")
+        return
 
     items = []
-    for e in feed.entries:
+    for e in entries:
         title = getattr(e, "title", "") or ""
         link = getattr(e, "link", "") or ""
         guid = getattr(e, "id", None) or link
@@ -132,4 +154,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # Для Cron Job лучше логировать и выходить без "краша" сервиса
+        # (Если хотите наоборот падать — уберите этот блок.)
+        print(f"Unhandled error: {e}")
+        sys.exit(0)
