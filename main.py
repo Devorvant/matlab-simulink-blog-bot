@@ -14,7 +14,7 @@ THINGSPEAK_RESULTS = int(os.getenv("THINGSPEAK_RESULTS", "20"))
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_CHAT_ID = os.getenv("CHANNEL_CHAT_ID")  # "@channel" или "-100..."
 
-TELEGRAM_DISABLE_PREVIEW = os.getenv("TELEGRAM_DISABLE_PREVIEW", "1") != "0"
+TELEGRAM_DISABLE_PREVIEW = os.getenv("TELEGRAM_DISABLE_PREVIEW", "0") != "0"
 
 # --- Поведение отправки ---
 # "list"  -> одним сообщением списком (может разбить на несколько, если длинно)
