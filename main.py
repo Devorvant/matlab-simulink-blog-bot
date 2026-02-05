@@ -1,231 +1,173 @@
 import os
-import time
-import sqlite3
 import html
-from datetime import datetime, timedelta, timezone
-from email.utils import parsedate_to_datetime
+from typing import List, Dict, Optional
 
 import requests
-from bs4 import BeautifulSoup
-
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None
 
 
-DEFAULT_RSS_FEED_URL = "https://it.mathworks.com/matlabcentral/profile/rss/v1/content/feed?source=blogs"
-DB_PATH = "state.sqlite"
+# --- ThingSpeak ---
+THINGSPEAK_CHANNEL_ID = os.getenv("THINGSPEAK_CHANNEL_ID", "247718")
+THINGSPEAK_READ_KEY = os.getenv("THINGSPEAK_READ_KEY")  # пусто если Public
+THINGSPEAK_RESULTS = int(os.getenv("THINGSPEAK_RESULTS", "20"))
 
-DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; matlab-simulink-blog-bot/1.1)",
-    "Accept": "application/rss+xml,application/xml;q=0.9,text/xml;q=0.8,*/*;q=0.7",
-    "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
-    "Connection": "close",
-}
+# --- Telegram (твои имена переменных) ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHANNEL_CHAT_ID = os.getenv("CHANNEL_CHAT_ID")  # "@channel" или "-100..."
 
+TELEGRAM_DISABLE_PREVIEW = os.getenv("TELEGRAM_DISABLE_PREVIEW", "1") != "0"
 
-def env_required(name: str) -> str:
-    v = os.getenv(name, "").strip()
-    if not v:
-        raise SystemExit(f"Missing env var: {name}")
-    return v
+# --- Поведение отправки ---
+# "list"  -> одним сообщением списком (может разбить на несколько, если длинно)
+# "single"-> по одному сообщению на каждую запись
+SEND_MODE = os.getenv("SEND_MODE", "single").strip().lower()
 
-
-def env_any(*names: str) -> str:
-    for n in names:
-        v = os.getenv(n, "").strip()
-        if v:
-            return v
-    raise SystemExit(f"Missing env var: one of {', '.join(names)}")
+STATE_FILE = os.getenv("STATE_FILE", "/tmp/last_sent_entry_id.txt")
 
 
-def normalize_channel(value: str) -> str:
-    v = value.strip()
-    if v.lstrip("-").isdigit():  # numeric chat id
-        return v
-    if not v.startswith("@"):
-        v = "@" + v
-    return v
+def fetch_thingspeak_feeds(channel_id: str, results: int = 20, read_key: Optional[str] = None) -> Dict:
+    url = f"https://api.thingspeak.com/channels/{channel_id}/feeds.json"
+    params = {"results": results}
+    if read_key:
+        params["api_key"] = read_key
+
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
 
-def get_tz():
-    tz_name = os.getenv("TZ", "Europe/Rome").strip()
-    if ZoneInfo is None:
-        return None, tz_name
+def load_last_sent_entry_id(path: str) -> int:
     try:
-        return ZoneInfo(tz_name), tz_name
+        with open(path, "r", encoding="utf-8") as f:
+            return int(f.read().strip())
     except Exception:
-        return None, tz_name
+        return 0
 
 
-def target_yesterday_date():
-    """
-    Вчера по TZ (по умолчанию Europe/Rome). Можно переопределить:
-    TARGET_DATE=YYYY-MM-DD
-    """
-    override = os.getenv("TARGET_DATE", "").strip()
-    if override:
-        return datetime.strptime(override, "%Y-%m-%d").date()
-
-    tz, _ = get_tz()
-    if tz is None:
-        return (datetime.utcnow() - timedelta(days=1)).date()
-
-    return (datetime.now(tz) - timedelta(days=1)).date()
+def save_last_sent_entry_id(path: str, entry_id: int) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(str(entry_id))
 
 
-def parse_bool_env(name: str, default: bool = False) -> bool:
-    v = os.getenv(name, "").strip().lower()
-    if not v:
-        return default
-    return v in {"1", "true", "yes", "y", "on"}
+def normalize_entries(data: Dict) -> List[Dict]:
+    feeds = data.get("feeds") or []
+    out = []
+
+    for f in feeds:
+        entry_id = f.get("entry_id")
+        title = (f.get("field1") or "").strip()
+        link = (f.get("field2") or "").strip()
+        created_at = f.get("created_at")
+
+        if not entry_id or not title or not link:
+            continue
+
+        out.append(
+            {
+                "entry_id": int(entry_id),
+                "title": title,
+                "link": link,
+                "created_at": created_at,
+            }
+        )
+
+    # старые -> новые
+    out.sort(key=lambda x: x["entry_id"])
+
+    # дедуп по ссылке
+    seen = set()
+    uniq = []
+    for x in out:
+        if x["link"] in seen:
+            continue
+        seen.add(x["link"])
+        uniq.append(x)
+
+    return uniq
 
 
-def http_get(session: requests.Session, url: str, timeout_s: int = 30) -> requests.Response:
-    # лёгкие ретраи для временных ошибок
-    for attempt in range(1, 4):
-        try:
-            r = session.get(url, headers=DEFAULT_HEADERS, timeout=timeout_s, allow_redirects=True)
-            if r.status_code in (429, 500, 502, 503, 504):
-                time.sleep(2 * attempt)
-                continue
-            return r
-        except Exception:
-            time.sleep(2 * attempt)
-    return session.get(url, headers=DEFAULT_HEADERS, timeout=timeout_s, allow_redirects=True)
-
-
-def init_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("CREATE TABLE IF NOT EXISTS posted (url TEXT PRIMARY KEY, posted_at TEXT NOT NULL)")
-    conn.commit()
-    return conn
-
-
-def already_posted(conn: sqlite3.Connection, url: str) -> bool:
-    cur = conn.execute("SELECT 1 FROM posted WHERE url = ?", (url,))
-    return cur.fetchone() is not None
-
-
-def mark_posted(conn: sqlite3.Connection, url: str) -> None:
-    conn.execute(
-        "INSERT OR IGNORE INTO posted(url, posted_at) VALUES(?, ?)",
-        (url, datetime.utcnow().isoformat()),
-    )
-    conn.commit()
-
-
-def parse_pubdate(pub: str) -> datetime | None:
-    s = (pub or "").strip()
-    if not s:
-        return None
-
-    # 1) ISO 8601, например 2026-02-04T09:24:25Z
-    try:
-        if s.endswith("Z"):
-            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        else:
-            dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except Exception:
-        pass
-
-    # 2) RFC822 (на всякий случай)
-    try:
-        dt = parsedate_to_datetime(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except Exception:
-        return None
-
-
-def extract_items_from_rss(xml_text: str) -> list[dict]:
-    soup = BeautifulSoup(xml_text, "xml")
-    items = []
-    for it in soup.find_all("item"):
-        title = it.title.get_text(strip=True) if it.title else ""
-        link = it.link.get_text(strip=True) if it.link else ""
-        pub = it.pubDate.get_text(strip=True) if it.pubDate else ""
-        if title and link and pub:
-            items.append({"title": title, "url": link, "pubDate": pub})
-    # дедуп по url
-    uniq = {p["url"]: p for p in items}
-    return list(uniq.values())
-
-
-def telegram_send_message(
-    session: requests.Session,
-    bot_token: str,
-    chat_id: str,
-    title: str,
-    url: str,
-    disable_preview: bool,
-) -> None:
-    api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    text = f"<b>{html.escape(title)}</b>\n{html.escape(url)}"
+def telegram_send(token: str, chat_id: str, text_html: str) -> None:
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
-        "text": text,
+        "text": text_html,
         "parse_mode": "HTML",
-        "disable_web_page_preview": disable_preview,
+        "disable_web_page_preview": TELEGRAM_DISABLE_PREVIEW,
     }
-    r = session.post(api_url, data=payload, timeout=30)
-    if r.status_code != 200:
-        raise RuntimeError(f"Telegram sendMessage failed: status={r.status_code} body={r.text}")
+    r = requests.post(url, json=payload, timeout=30)
+    r.raise_for_status()
 
 
-def main() -> None:
-    bot_token = env_required("BOT_TOKEN")
-    channel = normalize_channel(env_any("CHANNEL_CHAT_ID", "CHANNEL_USERNAME"))
+def chunk_list_message(lines: List[str], header: str = "") -> List[str]:
+    MAX_LEN = 3900
+    msgs = []
 
-    rss_url = os.getenv("RSS_FEED_URL", DEFAULT_RSS_FEED_URL).strip() or DEFAULT_RSS_FEED_URL
-    disable_preview = parse_bool_env("DISABLE_WEB_PAGE_PREVIEW", default=False)
+    cur = header.strip()
+    if cur:
+        cur += "\n\n"
 
-    yday = target_yesterday_date()
-    tz, tz_name = get_tz()
-    print(f"[INFO] TZ={tz_name} target_date(yesterday)={yday.isoformat()}")
-    print(f"[INFO] RSS_FEED_URL={rss_url}")
+    for line in lines:
+        add = line + "\n"
+        if len(cur) + len(add) > MAX_LEN:
+            msgs.append(cur.rstrip())
+            cur = ""
+        cur += add
 
-    conn = init_db()
+    if cur.strip():
+        msgs.append(cur.rstrip())
 
-    with requests.Session() as session:
-        r = http_get(session, rss_url)
-        if r.status_code != 200:
-            raise RuntimeError(f"RSS fetch failed: status={r.status_code} url={rss_url} body={r.text[:300]}")
+    return msgs
 
-        items = extract_items_from_rss(r.text)
-        print(f"[INFO] RSS items total: {len(items)}")
 
-        # фильтруем по дате "вчера" в нужной TZ
-        posts = []
-        for it in items:
-            dt = parse_pubdate(it.get("pubDate", ""))
-            if not dt:
-                continue
-            dt_local = dt.astimezone(tz) if tz is not None else dt.astimezone(timezone.utc)
-            if dt_local.date() == yday:
-                it["pub_dt"] = dt_local
-                posts.append(it)
+def main():
+    if not BOT_TOKEN or not CHANNEL_CHAT_ID:
+        raise SystemExit("Set BOT_TOKEN and CHANNEL_CHAT_ID env vars")
 
-        posts.sort(key=lambda x: (x["pub_dt"], x["url"]))
-        print(f"[INFO] Posts for {yday.isoformat()}: {len(posts)}")
+    data = fetch_thingspeak_feeds(
+        channel_id=THINGSPEAK_CHANNEL_ID,
+        results=THINGSPEAK_RESULTS,
+        read_key=THINGSPEAK_READ_KEY,
+    )
 
-        sent, skipped = 0, 0
-        for p in posts:
-            if already_posted(conn, p["url"]):
-                skipped += 1
-                continue
+    entries = normalize_entries(data)
+    if not entries:
+        print("No entries with field1/field2 found.")
+        return
 
-            telegram_send_message(session, bot_token, channel, p["title"], p["url"], disable_preview)
-            mark_posted(conn, p["url"])
-            sent += 1
-            time.sleep(1.0)
+    last_sent = load_last_sent_entry_id(STATE_FILE)
+    new_entries = [e for e in entries if e["entry_id"] > last_sent]
 
-        print(f"[DONE] sent={sent} skipped_already_posted={skipped}")
+    if not new_entries:
+        print(f"No new entries. last_sent_entry_id={last_sent}")
+        return
+
+    # --- отправка ---
+    if SEND_MODE == "single":
+        # по одному сообщению на запись
+        for e in new_entries:
+            title = html.escape(e["title"])
+            link = html.escape(e["link"])
+            msg = f"<b>{title}</b>\n{link}"
+            telegram_send(BOT_TOKEN, CHANNEL_CHAT_ID, msg)
+        print(f"Sent {len(new_entries)} entries as single messages.")
+    else:
+        # списком (1..N сообщений, если длинно)
+        lines = []
+        for e in new_entries:
+            title = html.escape(e["title"])
+            link = html.escape(e["link"])
+            lines.append(f"• <a href=\"{link}\">{title}</a>")
+
+        header = f"ThingSpeak {html.escape(THINGSPEAK_CHANNEL_ID)}: {len(new_entries)} new"
+        messages = chunk_list_message(lines, header=header)
+        for m in messages:
+            telegram_send(BOT_TOKEN, CHANNEL_CHAT_ID, m)
+        print(f"Sent {len(new_entries)} entries as list ({len(messages)} msg).")
+
+    # сохранить прогресс
+    max_sent = max(e["entry_id"] for e in new_entries)
+    save_last_sent_entry_id(STATE_FILE, max_sent)
+    print(f"Updated last_sent_entry_id={max_sent}")
 
 
 if __name__ == "__main__":
