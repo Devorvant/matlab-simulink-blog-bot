@@ -2,25 +2,37 @@ import os
 import time
 import sqlite3
 import html
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
 
 BASE = "https://blogs.mathworks.com/"
 BLOGGER_LIST_URL = urljoin(BASE, "blogger/")
 
 DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/123.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (compatible; matlab-simulink-blog-bot/1.0)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
     "Connection": "close",
 }
 
 DB_PATH = "state.sqlite"
+
+
+def env_any(*names: str) -> str:
+    for n in names:
+        v = os.getenv(n, "").strip()
+        if v:
+            return v
+    raise SystemExit(f"Missing env var: one of {', '.join(names)}")
 
 
 def env_required(name: str) -> str:
@@ -32,32 +44,35 @@ def env_required(name: str) -> str:
 
 def normalize_channel(value: str) -> str:
     v = value.strip()
-    if not v:
+    if v.lstrip("-").isdigit():  # numeric chat id
         return v
-    # allow numeric chat_id
-    if v.lstrip("-").isdigit():
-        return v
-    # public username
     if not v.startswith("@"):
         v = "@" + v
     return v
 
 
-def get_target_date_utc() -> datetime:
-    """
-    Берём ВЧЕРА в UTC (Railway cron показывает UTC).
-    Для теста можно задать TARGET_DATE=YYYY-MM-DD
-    """
+def get_tz():
+    tz_name = os.getenv("TZ", "Europe/Rome").strip()
+    if ZoneInfo is None:
+        return None
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return None
+
+
+def target_yesterday_date():
     override = os.getenv("TARGET_DATE", "").strip()
     if override:
-        dt = datetime.strptime(override, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        return dt
-    now = datetime.now(timezone.utc)
-    return (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return datetime.strptime(override, "%Y-%m-%d").date()
+
+    tz = get_tz()
+    if tz is None:
+        return (datetime.utcnow() - timedelta(days=1)).date()
+    return (datetime.now(tz) - timedelta(days=1)).date()
 
 
 def http_get(session: requests.Session, url: str, timeout_s: int = 30) -> requests.Response:
-    last_err = None
     for attempt in range(1, 4):
         try:
             r = session.get(url, headers=DEFAULT_HEADERS, timeout=timeout_s, allow_redirects=True)
@@ -65,17 +80,14 @@ def http_get(session: requests.Session, url: str, timeout_s: int = 30) -> reques
                 time.sleep(2 * attempt)
                 continue
             return r
-        except Exception as e:
-            last_err = e
+        except Exception:
             time.sleep(2 * attempt)
-    raise RuntimeError(f"GET failed: {url} | last error: {last_err}")
+    return session.get(url, headers=DEFAULT_HEADERS, timeout=timeout_s, allow_redirects=True)
 
 
 def init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS posted (url TEXT PRIMARY KEY, posted_at TEXT NOT NULL)"
-    )
+    conn.execute("CREATE TABLE IF NOT EXISTS posted (url TEXT PRIMARY KEY, posted_at TEXT NOT NULL)")
     conn.commit()
     return conn
 
@@ -88,23 +100,14 @@ def already_posted(conn: sqlite3.Connection, url: str) -> bool:
 def mark_posted(conn: sqlite3.Connection, url: str) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO posted(url, posted_at) VALUES(?, ?)",
-        (url, datetime.now(timezone.utc).isoformat()),
+        (url, datetime.utcnow().isoformat()),
     )
     conn.commit()
 
 
-def extract_blog_base_urls(session: requests.Session) -> list[str]:
-    """
-    Список блогов со страницы:
-    https://blogs.mathworks.com/blogger/
-    Берём ссылки вида https://blogs.mathworks.com/<slug>/
-    """
-    r = http_get(session, BLOGGER_LIST_URL)
-    if r.status_code != 200:
-        raise RuntimeError(f"Cannot open blogger list: {BLOGGER_LIST_URL} status={r.status_code}")
-
-    soup = BeautifulSoup(r.text, "html.parser")
-    bases = set()
+def extract_slugs_from_html(html_text: str) -> list[str]:
+    soup = BeautifulSoup(html_text, "html.parser")
+    slugs = set()
 
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
@@ -112,7 +115,6 @@ def extract_blog_base_urls(session: requests.Session) -> list[str]:
             continue
         if href.startswith("/"):
             href = urljoin(BASE, href)
-
         if not href.startswith(BASE):
             continue
 
@@ -128,35 +130,73 @@ def extract_blog_base_urls(session: requests.Session) -> list[str]:
         slug = segs[0].strip()
         if not slug:
             continue
-
-        if slug in {"blogger", "blogs", "search"}:
+        if slug in {"blogger", "blogs", "search", "tag", "category", "wp-content", "wp-json", "feedmlc"}:
             continue
         if slug.isdigit():
             continue
 
-        bases.add(urljoin(BASE, slug + "/"))
+        slugs.add(slug)
 
-    return sorted(bases)
+    return sorted(slugs)
+
+
+def extract_blog_base_urls_from_blogger(session: requests.Session) -> list[str] | None:
+    r = http_get(session, BLOGGER_LIST_URL)
+    if r.status_code != 200:
+        print(f"[WARN] /blogger/ blocked/unavailable: status={r.status_code}")
+        return None
+
+    slugs = extract_slugs_from_html(r.text)
+    return [urljoin(BASE, s + "/") for s in slugs]
+
+
+def extract_blog_base_urls_from_home(session: requests.Session) -> list[str] | None:
+    r = http_get(session, BASE)
+    if r.status_code != 200:
+        print(f"[WARN] home page blocked/unavailable: status={r.status_code}")
+        return None
+
+    slugs = extract_slugs_from_html(r.text)
+    if not slugs:
+        return None
+    return [urljoin(BASE, s + "/") for s in slugs]
+
+
+def blog_bases_from_slugs_file() -> list[str]:
+    path = os.getenv("BLOG_SLUGS_FILE", "").strip()
+    if not path:
+        return []
+    if not os.path.exists(path):
+        print(f"[WARN] BLOG_SLUGS_FILE not found: {path}")
+        return []
+    slugs = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip().strip("/")
+            if s and not s.startswith("#"):
+                slugs.append(s)
+    slugs = sorted(set(slugs))
+    return [urljoin(BASE, s + "/") for s in slugs]
+
+
+def blog_bases_fallback_from_env() -> list[str]:
+    slugs = os.getenv("BLOG_SLUGS", "").strip()
+    if not slugs:
+        return []
+    items = [s.strip().strip("/") for s in slugs.split(",") if s.strip()]
+    items = sorted(set(items))
+    return [urljoin(BASE, s + "/") for s in items]
 
 
 def extract_posts_from_daily_page(html_text: str) -> list[dict]:
-    """
-    На дневной странице /YYYY/MM/DD/ вытаскиваем заголовок и ссылку.
-    Обычно селектор: .entry-title a
-    """
     soup = BeautifulSoup(html_text, "html.parser")
     posts = []
-
     for a in soup.select(".entry-title a[href]"):
         title = a.get_text(strip=True)
         href = a.get("href", "").strip()
-        if not title or not href:
-            continue
-        posts.append({"title": title, "url": href})
-
-    uniq = {}
-    for p in posts:
-        uniq[p["url"]] = p
+        if title and href:
+            posts.append({"title": title, "url": href})
+    uniq = {p["url"]: p for p in posts}
     return list(uniq.values())
 
 
@@ -176,30 +216,37 @@ def telegram_send_message(session: requests.Session, bot_token: str, chat_id: st
 
 def main() -> None:
     bot_token = env_required("BOT_TOKEN")
-    channel = normalize_channel(env_required("CHANNEL_CHAT_ID"))
+    channel = normalize_channel(env_any("CHANNEL_CHAT_ID", "CHANNEL_USERNAME"))
 
-    target_date = get_target_date_utc()
-    yyyy = target_date.strftime("%Y")
-    mm = target_date.strftime("%m")
-    dd = target_date.strftime("%d")
-
-    print(f"[INFO] Target date (UTC): {target_date.date()}")
+    yday = target_yesterday_date()
+    yyyy, mm, dd = yday.strftime("%Y"), yday.strftime("%m"), yday.strftime("%d")
+    print(f"[INFO] Target date: {yday.isoformat()}")
 
     conn = init_db()
 
     with requests.Session() as session:
-        blog_bases = extract_blog_base_urls(session)
-        print(f"[INFO] Found blog bases: {len(blog_bases)}")
+        blog_bases = extract_blog_base_urls_from_blogger(session)
+
+        if not blog_bases:
+            blog_bases = extract_blog_base_urls_from_home(session)
+
+        if not blog_bases:
+            blog_bases = blog_bases_from_slugs_file()
+
+        if not blog_bases:
+            blog_bases = blog_bases_fallback_from_env()
+
+        if not blog_bases:
+            # минимальный дефолт, чтобы хоть что-то работало
+            blog_bases = [urljoin(BASE, s + "/") for s in ["matlab", "simulink", "cleve"]]
+            print("[WARN] Using minimal default slugs: matlab, simulink, cleve")
+
+        print(f"[INFO] Blog bases to scan: {len(blog_bases)}")
 
         all_posts = []
-
         for base_url in blog_bases:
             daily_url = urljoin(base_url, f"{yyyy}/{mm}/{dd}/")
-            try:
-                r = http_get(session, daily_url)
-            except Exception as e:
-                print(f"[WARN] {daily_url} fetch error: {e}")
-                continue
+            r = http_get(session, daily_url)
 
             if r.status_code == 404:
                 continue
@@ -212,16 +259,13 @@ def main() -> None:
                 print(f"[INFO] {daily_url} -> {len(posts)} post(s)")
                 all_posts.extend(posts)
 
-        uniq = {}
-        for p in all_posts:
-            uniq[p["url"]] = p
+        uniq = {p["url"]: p for p in all_posts}
         posts_to_send = list(uniq.values())
         posts_to_send.sort(key=lambda x: x["url"])
 
-        print(f"[INFO] Total unique posts for {target_date.date()}: {len(posts_to_send)}")
+        print(f"[INFO] Total unique posts for {yday.isoformat()}: {len(posts_to_send)}")
 
-        sent = 0
-        skipped = 0
+        sent, skipped = 0, 0
         for p in posts_to_send:
             if already_posted(conn, p["url"]):
                 skipped += 1
