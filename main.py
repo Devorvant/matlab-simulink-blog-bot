@@ -1,163 +1,251 @@
 import os
+import time
 import sqlite3
-import sys
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+import html
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urljoin, urlparse
 
-import feedparser
 import requests
-from dateutil import parser as dtparser
-
-RSS_URL = os.getenv("RSS_URL", "https://blogs.mathworks.com/feedmlc")
-TZ = os.getenv("TZ", "Europe/Rome")
-TIMEZONE = ZoneInfo(TZ)
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_CHAT_ID = os.getenv("CHANNEL_CHAT_ID", "@matlab_simulink_blog")
-
-MAX_POSTS = int(os.getenv("MAX_POSTS", "200"))
-DB_PATH = os.getenv("DB_PATH", "state.sqlite")
+from bs4 import BeautifulSoup
 
 
-def db_init():
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS posted (
-            guid TEXT PRIMARY KEY,
-            posted_at TEXT NOT NULL
-        )
-        """
+BASE = "https://blogs.mathworks.com/"
+BLOGGER_LIST_URL = urljoin(BASE, "blogger/")
+
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/123.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+    "Connection": "close",
+}
+
+DB_PATH = "state.sqlite"
+
+
+def env_required(name: str) -> str:
+    v = os.getenv(name, "").strip()
+    if not v:
+        raise SystemExit(f"Missing env var: {name}")
+    return v
+
+
+def normalize_channel(value: str) -> str:
+    v = value.strip()
+    if v.startswith("@"):
+        return v
+    # allow numeric chat_id
+    if v.lstrip("-").isdigit():
+        return v
+    return "@" + v
+
+
+def get_target_date_utc() -> datetime:
+    """
+    По умолчанию берём ВЧЕРА в UTC (так как Cron на Railway показывает UTC).
+    Для теста можно задать TARGET_DATE=YYYY-MM-DD
+    """
+    override = os.getenv("TARGET_DATE", "").strip()
+    if override:
+        dt = datetime.strptime(override, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return dt
+    now = datetime.now(timezone.utc)
+    return (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def http_get(session: requests.Session, url: str, timeout_s: int = 30) -> requests.Response:
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            r = session.get(url, headers=DEFAULT_HEADERS, timeout=timeout_s, allow_redirects=True)
+            # мягкие ретраи для временных проблем
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(2 * attempt)
+                continue
+            return r
+        except Exception as e:
+            last_err = e
+            time.sleep(2 * attempt)
+    raise RuntimeError(f"GET failed: {url} | last error: {last_err}")
+
+
+def init_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS posted (url TEXT PRIMARY KEY, posted_at TEXT NOT NULL)"
     )
-    con.commit()
-    return con
+    conn.commit()
+    return conn
 
 
-def was_posted(con, guid: str) -> bool:
-    cur = con.cursor()
-    cur.execute("SELECT 1 FROM posted WHERE guid = ?", (guid,))
+def already_posted(conn: sqlite3.Connection, url: str) -> bool:
+    cur = conn.execute("SELECT 1 FROM posted WHERE url = ?", (url,))
     return cur.fetchone() is not None
 
 
-def mark_posted(con, guid: str):
-    cur = con.cursor()
-    cur.execute(
-        "INSERT OR IGNORE INTO posted(guid, posted_at) VALUES(?, ?)",
-        (guid, datetime.now(tz=TIMEZONE).isoformat()),
+def mark_posted(conn: sqlite3.Connection, url: str) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO posted(url, posted_at) VALUES(?, ?)",
+        (url, datetime.now(timezone.utc).isoformat()),
     )
-    con.commit()
+    conn.commit()
 
 
-def parse_entry_datetime(entry) -> datetime | None:
-    published = getattr(entry, "published", None) or getattr(entry, "updated", None)
-    if not published:
-        return None
-    try:
-        dt = dtparser.parse(published)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=TIMEZONE)
-        return dt.astimezone(TIMEZONE)
-    except Exception:
-        return None
-
-
-def fetch_feed(url: str):
-    # Иногда без User-Agent/Accept сервер может вернуть HTML/ошибку вместо RSS
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; railway-bot/1.0)",
-        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
-    }
-    r = requests.get(url, headers=headers, timeout=30)
+def extract_blog_base_urls(session: requests.Session) -> list[str]:
+    """
+    Забираем список блогов со страницы Meet All Bloggers:
+    https://blogs.mathworks.com/blogger/
+    Берём только ссылки вида https://blogs.mathworks.com/<slug>/
+    """
+    r = http_get(session, BLOGGER_LIST_URL)
     if r.status_code != 200:
-        print(f"Feed HTTP {r.status_code}: {r.text[:200]}")
-        return None
-    return feedparser.parse(r.content)
+        raise RuntimeError(f"Cannot open blogger list: {BLOGGER_LIST_URL} status={r.status_code}")
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    bases = set()
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href:
+            continue
+
+        # относительные ссылки делаем абсолютными
+        if href.startswith("/"):
+            href = urljoin(BASE, href)
+
+        if not href.startswith(BASE):
+            continue
+
+        parsed = urlparse(href)
+        path = (parsed.path or "").strip("/")
+        if not path:
+            continue
+
+        # хотим ровно 1 сегмент: /matlab/ /simulink/ /cleve/ ...
+        segs = path.split("/")
+        if len(segs) != 1:
+            continue
+
+        slug = segs[0].strip()
+        if not slug:
+            continue
+
+        # отсекаем не-блоги
+        if slug in {"blogger", "blogs", "search"}:
+            continue
+        if slug.isdigit():
+            continue
+
+        bases.add(urljoin(BASE, slug + "/"))
+
+    return sorted(bases)
 
 
-def send_to_telegram(text: str):
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is not set")
+def extract_posts_from_daily_page(html_text: str) -> list[dict]:
+    """
+    На дневной странице /YYYY/MM/DD/ вытаскиваем заголовок и ссылку поста.
+    Обычно это .entry-title a
+    """
+    soup = BeautifulSoup(html_text, "html.parser")
+    posts = []
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    for a in soup.select(".entry-title a[href]"):
+        title = a.get_text(strip=True)
+        href = a.get("href", "").strip()
+        if not title or not href:
+            continue
+        posts.append({"title": title, "url": href})
+
+    # дедуп по url
+    uniq = {}
+    for p in posts:
+        uniq[p["url"]] = p
+    return list(uniq.values())
+
+
+def telegram_send_message(session: requests.Session, bot_token: str, chat_id: str, title: str, url: str) -> None:
+    api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+
+    text = f"<b>{html.escape(title)}</b>\n{html.escape(url)}"
     payload = {
-        "chat_id": CHANNEL_CHAT_ID,
+        "chat_id": chat_id,
         "text": text,
-        "disable_web_page_preview": False,
+        "parse_mode": "HTML",
+        # предпросмотр ссылок можно оставить (не отключаем)
+        # "disable_web_page_preview": False,
     }
-    r = requests.post(url, json=payload, timeout=30)
-    if not r.ok:
-        raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
+
+    r = session.post(api_url, data=payload, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"Telegram sendMessage failed: status={r.status_code} body={r.text}")
 
 
-def format_message(title: str, link: str) -> str:
-    title = (title or "").strip()
-    if title:
-        return f"{title}\n{link}"
-    return link
+def main() -> None:
+    bot_token = env_required("BOT_TOKEN")
+    channel = normalize_channel(env_required("CHANNEL_USERNAME"))
 
+    target_date = get_target_date_utc()
+    yyyy = target_date.strftime("%Y")
+    mm = target_date.strftime("%m")
+    dd = target_date.strftime("%d")
 
-def main():
-    con = db_init()
+    print(f"[INFO] Target date (UTC): {target_date.date()}")
 
-    now = datetime.now(tz=TIMEZONE)
-    target_date = (now - timedelta(days=1)).date()
+    conn = init_db()
 
-    feed = fetch_feed(RSS_URL)
-    if feed is None:
-        # Не падаем, чтобы Railway не делал ретраи
-        return
+    with requests.Session() as session:
+        # 1) список блогов
+        blog_bases = extract_blog_base_urls(session)
+        print(f"[INFO] Found blog bases: {len(blog_bases)}")
 
-    if getattr(feed, "bozo", False):
-        # bozo = была ошибка парсинга (например, "mismatched tag")
-        # Но иногда entries всё равно есть — тогда продолжаем.
-        print(f"Feed parse warning: {getattr(feed, 'bozo_exception', None)}")
+        all_posts = []
 
-    entries = getattr(feed, "entries", None) or []
-    if not entries:
-        # Не считаем это фатальной ошибкой
-        print("Feed has no entries (or could not be parsed into entries).")
-        return
+        # 2) обходим дневные страницы
+        for base_url in blog_bases:
+            daily_url = urljoin(base_url, f"{yyyy}/{mm}/{dd}/")
+            try:
+                r = http_get(session, daily_url)
+            except Exception as e:
+                print(f"[WARN] {daily_url} fetch error: {e}")
+                continue
 
-    items = []
-    for e in entries:
-        title = getattr(e, "title", "") or ""
-        link = getattr(e, "link", "") or ""
-        guid = getattr(e, "id", None) or link
+            if r.status_code == 404:
+                continue
+            if r.status_code != 200:
+                print(f"[WARN] {daily_url} status={r.status_code}")
+                continue
 
-        published_dt = parse_entry_datetime(e)
-        if not published_dt:
-            continue
+            posts = extract_posts_from_daily_page(r.text)
+            if posts:
+                print(f"[INFO] {daily_url} -> {len(posts)} post(s)")
+                all_posts.extend(posts)
 
-        if published_dt.date() != target_date:
-            continue
+        # 3) дедуп по url
+        uniq = {}
+        for p in all_posts:
+            uniq[p["url"]] = p
+        posts_to_send = list(uniq.values())
 
-        if was_posted(con, guid):
-            continue
+        # сортировка для стабильного порядка (по url)
+        posts_to_send.sort(key=lambda x: x["url"])
 
-        items.append((published_dt, guid, title, link))
+        print(f"[INFO] Total unique posts for {target_date.date()}: {len(posts_to_send)}")
 
-    items.sort(key=lambda x: x[0])
-    items = items[:MAX_POSTS]
+        # 4) отправка в Telegram
+        sent = 0
+        skipped = 0
+        for p in posts_to_send:
+            if already_posted(conn, p["url"]):
+                skipped += 1
+                continue
 
-    if not items:
-        print(f"No new posts for {target_date.isoformat()} in TZ={TZ}.")
-        return
+            telegram_send_message(session, bot_token, channel, p["title"], p["url"])
+            mark_posted(conn, p["url"])
+            sent += 1
+            time.sleep(1.0)  # чтобы не упереться в лимиты
 
-    for published_dt, guid, title, link in items:
-        msg = format_message(title, link)
-        send_to_telegram(msg)
-        mark_posted(con, guid)
-        print(f"Posted: {published_dt.isoformat()} | {title}")
-
-    print(f"Done. Posted {len(items)} item(s) for {target_date.isoformat()}.")
+        print(f"[DONE] sent={sent} skipped_already_posted={skipped}")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        # Для Cron Job лучше логировать и выходить без "краша" сервиса
-        # (Если хотите наоборот падать — уберите этот блок.)
-        print(f"Unhandled error: {e}")
-        sys.exit(0)
+    main()
