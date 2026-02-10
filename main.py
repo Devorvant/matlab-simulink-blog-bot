@@ -134,42 +134,41 @@ def main():
         print("No entries with field1/field2 found.")
         return
 
-    last_sent = load_last_sent_entry_id(STATE_FILE)
-    new_entries = [e for e in entries if e["entry_id"] > last_sent]
-
-    if not new_entries:
-        print(f"No new entries. last_sent_entry_id={last_sent}")
-        return
-
-    # --- отправка ---
+    # ВАЖНО: отправляем ВСЕ записи каждый запуск (сколько entry_id -> столько отправок)
     if SEND_MODE == "single":
-        # по одному сообщению на запись
-        for e in new_entries:
+        for e in entries:
+            entry_id = e["entry_id"]
             title = html.escape(e["title"])
             link = html.escape(e["link"])
-            msg = f"<b>{title}</b>\n{link}"
-            telegram_send(BOT_TOKEN, CHANNEL_CHAT_ID, msg)
-        print(f"Sent {len(new_entries)} entries as single messages.")
-    else:
-        # списком (1..N сообщений, если длинно)
-        lines = []
-        for e in new_entries:
-            title = html.escape(e["title"])
-            link = html.escape(e["link"])
-            lines.append(f"• <a href=\"{link}\">{title}</a>")
 
-        header = f"ThingSpeak {html.escape(THINGSPEAK_CHANNEL_ID)}: {len(new_entries)} new"
+            # канал + entry_id в тексте сообщения
+            msg = f"#{html.escape(THINGSPEAK_CHANNEL_ID)} / id={entry_id}\n<b>{title}</b>\n{link}"
+            telegram_send(BOT_TOKEN, CHANNEL_CHAT_ID, msg)
+
+        print(f"Sent {len(entries)} entries as single messages.")
+
+    else:
+        # list-режим оставил как был (если вдруг понадобится),
+        # но по твоему требованию лучше держать SEND_MODE=single
+        lines = []
+        for e in entries:
+            entry_id = e["entry_id"]
+            title = html.escape(e["title"])
+            link = html.escape(e["link"])
+            lines.append(f"• #{html.escape(THINGSPEAK_CHANNEL_ID)} / id={entry_id}: <a href=\"{link}\">{title}</a>")
+
+        header = f"ThingSpeak {html.escape(THINGSPEAK_CHANNEL_ID)}: {len(entries)} items"
         messages = chunk_list_message(lines, header=header)
         for m in messages:
             telegram_send(BOT_TOKEN, CHANNEL_CHAT_ID, m)
-        print(f"Sent {len(new_entries)} entries as list ({len(messages)} msg).")
 
-    # сохранить прогресс
-    max_sent = max(e["entry_id"] for e in new_entries)
+        print(f"Sent {len(entries)} entries as list ({len(messages)} msg).")
+
+    # STATE_FILE теперь НЕ влияет на отправку (мы его только обновляем “для истории/диагностики”)
+    max_sent = max(e["entry_id"] for e in entries)
     save_last_sent_entry_id(STATE_FILE, max_sent)
-    print(f"Updated last_sent_entry_id={max_sent}")
+    print(f"Updated last_sent_entry_id={max_sent} (state does NOT block sending)")
 
 
 if __name__ == "__main__":
     main()
-
