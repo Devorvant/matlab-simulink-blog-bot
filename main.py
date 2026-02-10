@@ -142,7 +142,7 @@ def main():
             link = html.escape(e["link"])
 
             # канал + entry_id в тексте сообщения
-            msg = f"#{html.escape(THINGSPEAK_CHANNEL_ID)} / id={entry_id}\n<b>{title}</b>\n{link}"
+            msg = f"<b>{title}</b>\n{link}"
             telegram_send(BOT_TOKEN, CHANNEL_CHAT_ID, msg)
 
         print(f"Sent {len(entries)} entries as single messages.")
