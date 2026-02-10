@@ -10,7 +10,7 @@ THINGSPEAK_CHANNEL_ID = os.getenv("THINGSPEAK_CHANNEL_ID", "247718")
 THINGSPEAK_READ_KEY = os.getenv("THINGSPEAK_READ_KEY")  # пусто если Public
 THINGSPEAK_RESULTS = int(os.getenv("THINGSPEAK_RESULTS", "20"))
 
-# --- Telegram (твои имена переменных) ---
+# --- Telegram ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_CHAT_ID = os.getenv("CHANNEL_CHAT_ID")  # "@channel" или "-100..."
 
@@ -35,14 +35,6 @@ def fetch_thingspeak_feeds(channel_id: str, results: int = 20, read_key: Optiona
     return r.json()
 
 
-def load_last_sent_entry_id(path: str) -> int:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return int(f.read().strip())
-    except Exception:
-        return 0
-
-
 def save_last_sent_entry_id(path: str, entry_id: int) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -51,12 +43,13 @@ def save_last_sent_entry_id(path: str, entry_id: int) -> None:
 
 def normalize_entries(data: Dict) -> List[Dict]:
     feeds = data.get("feeds") or []
-    out = []
+    out: List[Dict] = []
 
     for f in feeds:
         entry_id = f.get("entry_id")
         title = (f.get("field1") or "").strip()
         link = (f.get("field2") or "").strip()
+        text = (f.get("field3") or "").strip()
         created_at = f.get("created_at")
 
         if not entry_id or not title or not link:
@@ -66,6 +59,7 @@ def normalize_entries(data: Dict) -> List[Dict]:
             {
                 "entry_id": int(entry_id),
                 "title": title,
+                "text": text,  # field3
                 "link": link,
                 "created_at": created_at,
             }
@@ -74,7 +68,7 @@ def normalize_entries(data: Dict) -> List[Dict]:
     # старые -> новые
     out.sort(key=lambda x: x["entry_id"])
 
-    # дедуп по ссылке
+    # дедуп по ссылке (на всякий)
     seen = set()
     uniq = []
     for x in out:
@@ -119,6 +113,22 @@ def chunk_list_message(lines: List[str], header: str = "") -> List[str]:
     return msgs
 
 
+def build_single_message(title: str, text: str, link: str) -> str:
+    """
+    Формат:
+    <b>Title</b>
+    Text (обычный)
+    link
+    """
+    title_h = html.escape(title)
+    link_h = html.escape(link)
+    text_h = html.escape(text).strip()
+
+    if text_h:
+        return f"<b>{title_h}</b>\n{text_h}\n{link_h}"
+    return f"<b>{title_h}</b>\n{link_h}"
+
+
 def main():
     if not BOT_TOKEN or not CHANNEL_CHAT_ID:
         raise SystemExit("Set BOT_TOKEN and CHANNEL_CHAT_ID env vars")
@@ -134,28 +144,24 @@ def main():
         print("No entries with field1/field2 found.")
         return
 
-    # ВАЖНО: отправляем ВСЕ записи каждый запуск (сколько entry_id -> столько отправок)
+    # ВАЖНО: отправляем ВСЕ записи каждый запуск
     if SEND_MODE == "single":
         for e in entries:
-            entry_id = e["entry_id"]
-            title = html.escape(e["title"])
-            link = html.escape(e["link"])
-
-            # канал + entry_id в тексте сообщения
-            msg = f"<b>{title}</b>\n{link}"
+            msg = build_single_message(e["title"], e.get("text", ""), e["link"])
             telegram_send(BOT_TOKEN, CHANNEL_CHAT_ID, msg)
 
         print(f"Sent {len(entries)} entries as single messages.")
-
     else:
-        # list-режим оставил как был (если вдруг понадобится),
-        # но по твоему требованию лучше держать SEND_MODE=single
+        # list-режим (заголовок кликабельный, snippet добавим после тире)
         lines = []
         for e in entries:
-            entry_id = e["entry_id"]
             title = html.escape(e["title"])
             link = html.escape(e["link"])
-            lines.append(f"• #{html.escape(THINGSPEAK_CHANNEL_ID)} / id={entry_id}: <a href=\"{link}\">{title}</a>")
+            text = html.escape((e.get("text") or "").strip())
+            if text:
+                lines.append(f"• <a href=\"{link}\">{title}</a>\n{text}")
+            else:
+                lines.append(f"• <a href=\"{link}\">{title}</a>")
 
         header = f"ThingSpeak {html.escape(THINGSPEAK_CHANNEL_ID)}: {len(entries)} items"
         messages = chunk_list_message(lines, header=header)
@@ -164,7 +170,7 @@ def main():
 
         print(f"Sent {len(entries)} entries as list ({len(messages)} msg).")
 
-    # STATE_FILE теперь НЕ влияет на отправку (мы его только обновляем “для истории/диагностики”)
+    # STATE_FILE не блокирует отправку — просто пишем “для истории”
     max_sent = max(e["entry_id"] for e in entries)
     save_last_sent_entry_id(STATE_FILE, max_sent)
     print(f"Updated last_sent_entry_id={max_sent} (state does NOT block sending)")
