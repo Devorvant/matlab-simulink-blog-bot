@@ -4,7 +4,7 @@ from typing import List, Dict, Optional
 
 import requests
 
-
+ 
 # --- ThingSpeak ---
 THINGSPEAK_CHANNEL_ID = os.getenv("THINGSPEAK_CHANNEL_ID", "247718")
 THINGSPEAK_READ_KEY = os.getenv("THINGSPEAK_READ_KEY")  # пусто если Public
